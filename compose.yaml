@@ -1,0 +1,71 @@
+name: pratica-juiz-local
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pratica-juiz-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-assessor}
+      POSTGRES_USER: ${POSTGRES_USER:-assessor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Configure POSTGRES_PASSWORD in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/01-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  mongodb:
+    image: mongo:7.0
+    container_name: pratica-juiz-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27018}:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    container_name: pratica-juiz-qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?Configure QDRANT_API_KEY in .env}
+    ports:
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  qdrant-init:
+    image: curlimages/curl:8.12.1
+    container_name: pratica-juiz-qdrant-init
+    restart: "no"
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?Configure QDRANT_API_KEY in .env}
+      QDRANT_URL: http://qdrant:6333
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        until curl --silent --fail -H "api-key: $$QDRANT_API_KEY" "$$QDRANT_URL/collections" >/dev/null; do sleep 2; done
+        for collection in memoria_perfil memoria_resumos faq_chuncks; do
+          if ! curl --silent --fail -H "api-key: $$QDRANT_API_KEY" "$$QDRANT_URL/collections/$$collection" >/dev/null; then
+            curl --fail --show-error -X PUT -H "api-key: $$QDRANT_API_KEY" -H "Content-Type: application/json" \
+              -d '{"vectors":{"size":768,"distance":"Cosine"}}' "$$QDRANT_URL/collections/$$collection"
+          fi
+        done
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  qdrant_data:
