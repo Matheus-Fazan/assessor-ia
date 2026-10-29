@@ -258,7 +258,11 @@ def fechar_turno(turno_id: str, session_id: str, rota: str, status: str) -> None
 def status_do_estado(estado: dict) -> str:
     """Bloqueio de entrada é o sistema funcionando. Erro fica para a exceção."""
     for nome in estado.get("agentes_chamados") or []:
-        if isinstance(nome, str) and nome.startswith("guardrail_entrada:") and nome != "guardrail_entrada:aprovado":
+        if isinstance(nome, str) and (nome.startswith("juiz:erro") or nome in ("juiz:sem_chave", "juiz:sem_resposta")):
+            return "erro"
+        if isinstance(nome, str) and (nome.startswith("juiz:sem_apoio") or nome.startswith("juiz:parcial") or nome.startswith("juiz:apoiada:abaixo_do_limiar")):
+            return "bloqueado"
+        if isinstance(nome, str) and (nome == "guardrail_entrada" or (nome.startswith("guardrail_entrada:") and nome != "guardrail_entrada:aprovado")):
             return "bloqueado"
     return "ok"
 

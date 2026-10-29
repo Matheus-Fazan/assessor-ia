@@ -28,13 +28,15 @@ from app.tools.calendario_google import TOOLS_GOOGLE
 from app.memory import salvar_mensagem
 from app.observabilidade import abrir_turno, fechar_turno, status_do_estado
 from app.juiz import no_juiz
+from app.tool_holder import holder_context, juiz_aprovou
+from app.tool_interceptor import interceptar_tools
 
 router_memory = MemorySaver()
 
 agenda_app = create_agent(
     model=llm_especialista,
-    tools=TOOLS_AGENDA + TOOLS_GOOGLE + TOOLS_MEMORIA,
-    system_prompt=AGENDA_PROMPT_COMPLETO,
+    tools=interceptar_tools(TOOLS_AGENDA + TOOLS_GOOGLE) + TOOLS_MEMORIA,
+    system_prompt=AGENDA_PROMPT_COMPLETO + "\nUma tool com status prepared apenas preparou a operação. Informe que aguarda validação; não afirme que foi concluída nem invente id de banco.",
 )
 
 router_app = create_agent(
@@ -46,8 +48,8 @@ router_app = create_agent(
 
 financeiro_app = create_agent(
     model=llm_especialista,
-    tools=TOOLS + TOOLS_MEMORIA + TOOL_PERFIL,
-    system_prompt=FINANCEIRO_PROMPT_COMPLETO
+    tools=interceptar_tools(TOOLS) + TOOLS_MEMORIA + TOOL_PERFIL,
+    system_prompt=FINANCEIRO_PROMPT_COMPLETO + "\nUma tool com status prepared apenas preparou a operação. Informe que aguarda validação; não afirme que foi concluída nem invente id de banco."
 )
 
 orquestrador_app = create_agent(
@@ -210,30 +212,52 @@ def executar_fluxo_assessor(
     pergunta_usuario: str, session_id: str, user_id: str = "usuario_teste"
 ) -> str:
     pergunta_usuario_anonimizado, _ = anonimizar_entrada(pergunta_usuario)
-    estado_inicial = {
-        "messages":         [{"role": "human", "content": pergunta_usuario}],
-        "agentes_chamados": [],
-        "rota":             "",
-        "mapa_pii":         {},
-        "session_id":       session_id,
-    }
     turno_id = abrir_turno()
-
+    marcador = f"turno:{turno_id}"
+    estado_inicial = {
+        "messages": [{"role": "human", "content": pergunta_usuario}],
+        "agentes_chamados": [marcador],
+        "rota": "", "mapa_pii": {}, "session_id": session_id,
+    }
     status = "erro"
     rota = ""
     try:
-        estado_final = fluxo_agentes.invoke(
-            estado_inicial,
-            config={"configurable": {"thread_id": session_id, "user_id": user_id}},
-        )
-
-        resposta = estado_final["messages"][-1].text
-
-        salvar_mensagem(session_id, "human",     pergunta_usuario_anonimizado, user_id=user_id)
-        salvar_mensagem(session_id, "assistant", resposta, user_id=user_id)
-
-        status = status_do_estado(estado_final)
-        rota = estado_final.get("rota") or ""
-        return resposta
+        with holder_context() as holder:
+            estado_final = fluxo_agentes.invoke(
+                estado_inicial,
+                config={"configurable": {"thread_id": session_id, "user_id": user_id}},
+            )
+            resposta = estado_final["messages"][-1].text
+            agentes = estado_final.get("agentes_chamados") or []
+            if marcador not in agentes:
+                raise RuntimeError("Marcador do turno ausente no estado do grafo.")
+            atuais = agentes[len(agentes) - 1 - agentes[::-1].index(marcador) + 1:]
+            decisao = next((a for a in reversed(atuais) if isinstance(a, str) and a.startswith("juiz:")), "")
+            aprovado = juiz_aprovou(decisao)
+            status = status_do_estado({"agentes_chamados": atuais})
+            if holder.has_operations():
+                if aprovado:
+                    resultados = holder.commit()
+                    concluidas = [r["tool_name"] for r in resultados if isinstance(r["result"], dict) and r["result"].get("status") == "ok"]
+                    falhas = [r["tool_name"] for r in resultados if not isinstance(r["result"], dict) or r["result"].get("status") != "ok"]
+                    if falhas:
+                        resposta = "Não foi possível concluir todas as alterações."
+                        if concluidas:
+                            resposta += " Concluídas: " + ", ".join(concluidas) + "."
+                        resposta += " Não concluídas: " + ", ".join(falhas) + "."
+                        status = "erro"
+                    else:
+                        resposta += "\n\nAs operações preparadas foram concluídas."
+                else:
+                    holder.discard()
+                    resposta = "Não foi possível aprovar a gravação. Nenhuma alteração foi feita."
+                    status = "erro" if not decisao or decisao.startswith(("juiz:erro", "juiz:sem_chave", "juiz:sem_resposta")) else "bloqueado"
+            rota = estado_final.get("rota") or ""
+            salvar_mensagem(session_id, "human", pergunta_usuario_anonimizado, user_id=user_id)
+            salvar_mensagem(session_id, "assistant", resposta, user_id=user_id)
+            return resposta
+    except Exception:
+        status = "erro"
+        raise
     finally:
         fechar_turno(turno_id, session_id=session_id, rota=rota, status=status)
